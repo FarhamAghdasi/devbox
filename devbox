@@ -1,0 +1,536 @@
+#!/usr/bin/env bash
+# devbox — Laravel Development Environment Manager for Fedora
+# Usage: devbox [command] [subcommand] [args...]
+
+set -euo pipefail
+
+DEVBOX_VERSION="0.1.0"
+QUIET=0
+
+# ---- bootstrap ----
+
+DEVBOX_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+MODULES_DIR="${DEVBOX_DIR}/modules"
+CONF_FILE="${DEVBOX_DIR}/config/defaults.conf"
+
+# Sudo detection
+if [[ $EUID -eq 0 ]]; then
+    SUDO=""
+    echo "Warning: running as root. This is not recommended." >&2
+else
+    if command -v sudo &>/dev/null; then
+        SUDO="sudo"
+    else
+        SUDO=""
+        echo "Warning: sudo not found. Some commands may fail." >&2
+    fi
+fi
+export SUDO
+
+# Load config
+if [[ -f "$CONF_FILE" ]]; then
+    # shellcheck disable=SC1090
+    source "$CONF_FILE"
+fi
+
+# Load .env overrides (optional)
+if [[ -f "${DEVBOX_DIR}/.env" ]]; then
+    # shellcheck disable=SC1090
+    source "${DEVBOX_DIR}/.env"
+fi
+
+# Load modules
+for mod in ui services info database laravel phpmyadmin; do
+    modfile="${MODULES_DIR}/${mod}.sh"
+    if [[ -f "$modfile" ]]; then
+        # shellcheck disable=SC1090
+        source "$modfile"
+    else
+        echo "Warning: module not found: ${modfile}" >&2
+    fi
+done
+
+# ---- helpers ----
+
+check_deps() {
+    local missing=()
+    for cmd in "$@"; do
+        if ! command -v "$cmd" &>/dev/null; then
+            missing+=("$cmd")
+        fi
+    done
+    if (( ${#missing[@]} )); then
+        ui_red "Missing dependencies: ${missing[*]}"
+        return 1
+    fi
+    return 0
+}
+
+_usage() {
+    cat <<EOF
+$(ui_bold "DevBox — Laravel Development Environment Manager")
+
+$(ui_cyan "Service commands:")
+  start                  Start all services (Apache + MariaDB)
+  stop                   Stop all services
+  restart                Restart all services
+  status                 Show service status
+
+  apache <start|stop|restart|status|enable|disable>
+  mysql  <start|stop|restart|status|enable|disable>
+  phpmyadmin <status|setup|info>    phpMyAdmin commands
+
+$(ui_cyan "Info:")
+  info                   Show system and stack information
+  project-info [path]    Show project information
+  php info               Show PHP details
+  --version, -V          Show DevBox version
+  -q, --quiet            Suppress non-error output
+
+$(ui_cyan "Laravel:")
+  laravel-check          Check current folder for Laravel project
+
+$(ui_cyan "Database:")
+  db info                 Show database server information
+  db size <name>          Show database and table sizes
+  db list                 List databases
+  db create <name>        Create a database
+  db drop <name>          Drop a database (with confirmation)
+  db backup <name> [file]   Backup a database
+  db restore <file> [name]  Restore a database
+
+$(ui_cyan "MySQL config:")
+  mysql config show      Show current MySQL user/host/port settings
+
+$(ui_cyan "Interactive mode:")
+  devbox                 Launch interactive menu
+
+$(ui_cyan "Other:")
+  uninstall              Remove DevBox from this system
+  self-update            Update DevBox from git (if installed from source)
+EOF
+}
+
+_is_service_name() {
+    case "$1" in
+        apache|httpd|mysql|mariadb|phpmyadmin) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# ---- CLI dispatch ----
+
+_cmd_service() {
+    local svc="$1"
+    local action="${2:-}"
+    shift 2 || true
+
+    case "$action" in
+        start)   svc_start "$svc" ;;
+        stop)    svc_stop "$svc" ;;
+        restart) svc_restart "$svc" ;;
+        status)  svc_status "$svc" ;;
+        enable)  svc_enable "$svc" ;;
+        disable) svc_disable "$svc" ;;
+        "")
+            echo "Error: action required. Usage: devbox ${svc} <start|stop|restart|status|enable|disable>"
+            return 1
+            ;;
+        *)
+            echo "Error: unknown action '${action}' for ${svc}"
+            return 1
+            ;;
+    esac
+}
+
+_cmd_db() {
+    local action="${1:-}"
+    shift || true
+
+    case "$action" in
+        info)    db_info ;;
+        size)    db_size "${1:-}" ;;
+        list)    db_list ;;
+        create)  db_create "${1:-}" ;;
+        drop)    db_drop "${1:-}" ;;
+        backup)  db_backup "${1:-}" "${2:-}" ;;
+        restore) db_restore "${1:-}" "${2:-}" ;;
+        "")
+            echo "Error: db subcommand required."
+            echo "Usage: devbox db <list|create|drop|backup|restore> ..."
+            return 1
+            ;;
+        *)
+            echo "Error: unknown db subcommand '${action}'"
+            return 1
+            ;;
+    esac
+}
+
+# ---- interactive menu ----
+
+_menu_item() {
+    # _menu_item "label" "action" "enabled"
+    local label="$1" action="$2" enabled="${3:-1}"
+    if (( enabled )); then
+        ui_bold "  $label"
+    else
+        ui_dim "  $label"
+    fi
+}
+
+_interactive_menu() {
+    trap 'echo ""; echo "Bye."; exit 0' INT
+
+    while true; do
+        clear
+        ui_header "DevBox Laravel Manager"
+        echo ""
+        echo "  1) Start all services"
+        echo "  2) Stop all services"
+        echo "  3) Restart all services"
+        echo ""
+        echo "  4) Service status"
+        echo "  5) phpMyAdmin setup"
+        echo "  6) Enable/Disable service"
+        echo ""
+        echo "  7) Database information"
+        echo "  8) PHP information"
+        echo "  9) Laravel project check"
+        echo "  10) System information"
+        echo "  11) Project information"
+        echo ""
+        echo "  0) Exit"
+        echo ""
+        ui_separator
+        printf "Select an option: "
+        read -r choice
+
+        case "$choice" in
+            1)
+                echo ""
+                svc_start apache
+                svc_start mysql
+                echo ""
+                read -p "Press Enter to continue..."
+                ;;
+            2)
+                echo ""
+                svc_stop apache
+                svc_stop mysql
+                echo ""
+                read -p "Press Enter to continue..."
+                ;;
+            3)
+                echo ""
+                svc_restart apache
+                svc_restart mysql
+                echo ""
+                read -p "Press Enter to continue..."
+                ;;
+            4)
+                echo ""
+                svc_all
+                echo ""
+                read -p "Press Enter to continue..."
+                ;;
+            5)
+                phpmyadmin_setup
+                read -p "Press Enter to continue..."
+                ;;
+            6)
+                echo ""
+                read -p "Enable or Disable (e/d)? " edchoice
+                case "$edchoice" in
+                    e|E|enable)
+                        read -p "Enable which service (apache/mysql)? " sname
+                        case "$sname" in
+                            apache|httpd) svc_enable apache ;;
+                            mysql|mariadb) svc_enable mysql ;;
+                            *) ui_red "Unknown service." ;;
+                        esac
+                        ;;
+                    d|D|disable)
+                        read -p "Disable which service (apache/mysql)? " sname
+                        case "$sname" in
+                            apache|httpd) svc_disable apache ;;
+                            mysql|mariadb) svc_disable mysql ;;
+                            *) ui_red "Unknown service." ;;
+                        esac
+                        ;;
+                    *) ui_red "Invalid choice." ;;
+                esac
+                echo ""
+                read -p "Press Enter to continue..."
+                ;;
+            7)
+                echo ""
+                db_list
+                echo ""
+                read -p "Press Enter to continue..."
+                ;;
+            8)
+                echo ""
+                ui_subheader "PHP Information"
+                info_php
+                echo ""
+                read -p "Press Enter to continue..."
+                ;;
+            9)
+                echo ""
+                read -p "Laravel project path (default: current)? " lpath
+                laravel_check "${lpath:-.}"
+                echo ""
+                read -p "Press Enter to continue..."
+                ;;
+            10)
+                echo ""
+                info_all
+                echo ""
+                read -p "Press Enter to continue..."
+                ;;
+            0)
+                echo "Bye."
+                exit 0
+                ;;
+            *)
+                echo ""
+                ui_red "Invalid option."
+                sleep 1
+                ;;
+        esac
+    done
+}
+
+# ---- main ----
+
+_devbox_uninstall() {
+    local install_bin_dir="${HOME}/.local/bin"
+    local install_data_dir="${HOME}/.local/share/devbox"
+    local install_path="${install_bin_dir}/devbox"
+
+    ui_header "Uninstall DevBox"
+    echo ""
+    ui_yellow "This will remove DevBox from your system."
+    echo ""
+    echo "The following will be removed:"
+    echo "  - ${install_path}"
+    echo "  - ${install_data_dir}"
+    echo ""
+    ui_bold "The following will NOT be touched:"
+    echo "  - Databases"
+    echo "  - Laravel projects"
+    echo "  - Apache configuration"
+    echo "  - MariaDB / PHP installations"
+    echo ""
+
+    read -p "Continue? (yes/no): " confirm
+    if [[ "$confirm" != "yes" ]]; then
+        echo "Cancelled."
+        return 0
+    fi
+
+    local removed=0
+
+    if [[ -L "$install_path" ]] || [[ -f "$install_path" ]]; then
+        rm -f "$install_path"
+        echo "Removed: ${install_path}"
+        removed=$((removed + 1))
+    else
+        ui_yellow "Symlink not found at ${install_path}"
+    fi
+
+    if [[ -d "$install_data_dir" ]]; then
+        if [[ -f "${install_data_dir}/.env" ]]; then
+            ui_yellow "Warning: ${install_data_dir}/.env exists and will be removed."
+            echo "  This may contain your phpMyAdmin password or other custom settings."
+            read -p "Continue? (yes/no): " confirm
+            if [[ "$confirm" != "yes" ]]; then
+                echo "Cancelled."
+                return 0
+            fi
+        fi
+        rm -rf "$install_data_dir"
+        echo "Removed: ${install_data_dir}"
+        removed=$((removed + 1))
+    else
+        ui_yellow "Data directory not found at ${install_data_dir}"
+    fi
+
+    echo ""
+    if (( removed > 0 )); then
+        ui_success "DevBox uninstalled."
+    else
+        ui_yellow "Nothing to remove."
+    fi
+    echo ""
+}
+
+_devbox_self_update() {
+    ui_header "Self-Update DevBox"
+    echo ""
+
+    if ! command -v git &>/dev/null; then
+        ui_red "Error: git is required for self-update."
+        echo "  Install with: sudo dnf install git"
+        return 1
+    fi
+
+    if [[ ! -d "${DEVBOX_DIR}/.git" ]]; then
+        ui_red "Error: DevBox is not installed from a git repository."
+        echo "  Update manually by reinstalling from the repository."
+        return 1
+    fi
+
+    ui_yellow "Pulling latest changes..."
+    if git -C "$DEVBOX_DIR" pull --ff-only; then
+        ui_success "Code updated."
+        echo ""
+        ui_yellow "Re-running install.sh to apply updates..."
+        if bash "${DEVBOX_DIR}/install.sh"; then
+            ui_success "DevBox updated successfully."
+        else
+            ui_red "Error: install.sh failed."
+            return 1
+        fi
+    else
+        ui_red "Error: git pull failed."
+        echo "  You may have local changes. Stash or reset them first."
+        return 1
+    fi
+    echo ""
+}
+
+if [[ $# -eq 0 ]]; then
+    _interactive_menu
+    exit 0
+fi
+
+# Extract global flags
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -q|--quiet)
+            QUIET=1
+            shift
+            ;;
+        --)
+            shift
+            break
+            ;;
+        -*)
+            # Unknown flag, leave it for command parsing
+            break
+            ;;
+        *)
+            break
+            ;;
+    esac
+done
+
+cmd="${1:-}"
+shift || true
+
+case "$cmd" in
+    start)
+        svc_start apache
+        svc_start mysql
+        echo ""
+        svc_all
+        ;;
+    stop)
+        svc_stop apache
+        svc_stop mysql
+        echo ""
+        svc_all
+        ;;
+    restart)
+        svc_restart apache
+        svc_restart mysql
+        echo ""
+        svc_all
+        ;;
+    status)
+        svc_all
+        ;;
+    apache|httpd)
+        _cmd_service apache "$@"
+        ;;
+    mysql|mariadb)
+        if [[ "${1:-}" == "config" ]]; then
+            shift
+            case "${1:-}" in
+                show) mysql_config_show ;;
+                "")
+                    echo "Error: mysql config subcommand required."
+                    echo "Usage: devbox mysql config <show>"
+                    return 1
+                    ;;
+                *)
+                    echo "Error: unknown mysql config subcommand '${1:-}'"
+                    return 1
+                    ;;
+            esac
+        else
+            _cmd_service mysql "$@"
+        fi
+        ;;
+    phpmyadmin)
+        case "${1:-}" in
+            status) svc_phpmyadmin_status ;;
+            setup)  phpmyadmin_setup ;;
+            info)   phpmyadmin_info ;;
+            enable|disable)
+                echo "phpMyAdmin is managed via Apache config, not a systemd service."
+                echo "Use 'sudo dnf install phpMyAdmin' or 'sudo dnf remove phpMyAdmin'."
+                ;;
+            *)
+                echo "Usage: devbox phpmyadmin <status|setup|info>"
+                ;;
+        esac
+        ;;
+    info)
+        info_all
+        ;;
+    project-info)
+        project_info "${1:-.}"
+        ;;
+    php)
+        case "${1:-}" in
+            info) info_php ;;
+            "")
+                echo "Error: php subcommand required."
+                echo "Usage: devbox php <info>"
+                exit 1
+                ;;
+            *)
+                echo "Error: unknown php subcommand '${1:-}'"
+                echo "Usage: devbox php <info>"
+                exit 1
+                ;;
+        esac
+        ;;
+    laravel-check)
+        laravel_check "${1:-.}"
+        ;;
+    db)
+        _cmd_db "$@"
+        ;;
+    -h|--help|help)
+        _usage
+        ;;
+    -v|--version|-V)
+        echo "devbox ${DEVBOX_VERSION}"
+        exit 0
+        ;;
+    uninstall)
+        _devbox_uninstall
+        ;;
+    self-update)
+        _devbox_self_update
+        ;;
+    *)
+        echo "Error: unknown command '${cmd}'"
+        _usage
+        exit 1
+        ;;
+esac
